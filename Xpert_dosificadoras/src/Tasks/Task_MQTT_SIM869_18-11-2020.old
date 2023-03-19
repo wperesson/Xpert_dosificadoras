@@ -1,0 +1,794 @@
+/*
+ * TaskMQTT.c
+ *
+ *  Created on: Dic 2017
+ *  Author: wperesson
+ */
+
+#include "board.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "Definiciones.h"
+#include "GSM.h"
+#include "GPRS_MQTTClient.h"
+#include "GPRS.h"
+#include "mqtt_SC.h"
+
+#if USE_SIM868
+
+#define UART				LPC_UART3
+#define LOC_BUFF_SZ			50
+#define REF_RATE			60000
+#define CTRL_REF_FACT		50
+#define QOS					MQTT_QOS_1
+#define REF_COUNTER_LIM		10
+#define MIN_MQTT_REF_TIME	1
+#define MAX_MQTT_REF_TIME	3600
+
+///*Flag states*/
+//typedef enum {
+//	b_conected_to_broker, b_suscribed
+//} Flags_state_type;
+
+/*Timer indexes*/
+typedef enum {
+	tmr_ref_var_idx, tmr_ref_cise_idx
+} tmr_ref_idx_type;
+
+/*mqtt state chart status*/
+typedef enum {
+	mqtt_st_not_connected, mqtt_st_connected_to_broker,
+} mqtt_status_type;
+
+bool conected_to_broker;
+//char Reg_status_flags = 0; //Flags que indican que estados u operaciones fueron relizadas
+
+void print_to_RS485(char *str) {
+	uint16_t len;
+	char head[] = "-------->";
+	char *ptr = head;
+
+	if (sniff_gsm || debug_gsm) {
+		len = strlen(ptr);
+		while ((xQueueSend(queMsgToRS485, ptr++, 10) != errQUEUE_FULL)
+				&& (len > 0)) {
+			len--;
+		}
+
+		len = strlen(str);
+		while ((xQueueSend(queMsgToRS485, str++, 10) != errQUEUE_FULL)
+				&& (len > 0)) {
+			len--;
+		}
+
+		ptr = head;
+		sprintf(ptr, "\r\n");
+		len = strlen(ptr);
+		while ((xQueueSend(queMsgToRS485, ptr++, 10) != errQUEUE_FULL)
+				&& (len > 0)) {
+			len--;
+		}
+	}
+}
+
+#if DEBUG
+#define PRINT(x)	print_to_RS485(x)
+#else
+#define PRINT(x)
+#endif
+
+/* Envía un estado a la cola*/
+void next_event(mqtt_event_type event) {
+	//Enviar a la cola para su ejecución
+	xQueueSend(queMQTT_ev, &event, 0);
+}
+
+/* Envía un evento al frente de la cola para que sea ejecutado inmediatamante*/
+void next_inm_state(mqtt_event_type event) {
+	//Enviar a la cola para su ejecución
+	xQueueSendToFront(queMQTT_ev, &event, 0);
+}
+
+/* Ping request*/
+bool ping_req(char *buff) {
+	uint16_t len;
+	int16_t Recb;
+
+	/*SEND PING REQUEST*/
+	len = MQTT_PingReqPacket((uint8_t*) buff);
+	Recb = TCP_send(buff, len);
+	if (Recb > 0) {
+		/*El servidor devolvió una respuesta*/
+		if (buff[0] == (MQTT_CTRL_PINGRESP << 4) && buff[1] == 0 //Remaining Length
+				)
+			/*PING RESP OK !!!!*/
+			return true;
+	}
+	return false;
+}
+
+/* Callback de los timers*/
+void vTmrRefDataCallback(xTimerHandle pxTimer) {
+
+	configASSERT(pxTimer);
+	int32_t tmr_idx;
+//  mqtt_state_type loc_mqtt_st;
+
+	tmr_idx = (int32_t) pvTimerGetTimerID(pxTimer);
+
+	switch (tmr_idx) {
+	case tmr_ref_var_idx:
+		if (conected_to_broker) {
+			next_event(mqtt_ev_publish_variables);
+		}
+		break;
+	case tmr_ref_cise_idx:
+		if (conected_to_broker) {
+			next_event(mqtt_ev_publish_commands);
+			next_event(mqtt_ev_publish_id);
+			next_event(mqtt_ev_publish_sett);
+			next_event(mqtt_ev_publish_alarms);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
+	char buff_MQTT[MQTT_BUFF_SIZE];
+	static uint16_t len, mem_mqtt_ref_rate;
+	static uint16_t cnt_conn_retry; //Contador de intentos de conexión
+	static uint16_t fact_ref_rate; //Factor de retraso para conecciones erróneas
+	static tcp_send_Type Recb;
+	static Bool subscribed; //Flag de suscripción activa
+	uint16_t attempt_cnt;
+	uint8_t cont_coord_report_posit;
+	mqtt_event_type mqtt_ev;
+	mqtt_event_type mqtt_prev_st; //Almacena el estado previo.
+	char *ptr;
+	uint8_t PackID_LSB, PackID_MSB;
+	char losant_state_head[50];
+	xTimerHandle timer_ref_var, timer_ref_cise;
+	Mqtt_sc mqtt_sc;
+
+	if ((SP.mqtt_ref_rate >= MIN_MQTT_REF_TIME)
+			& (SP.mqtt_ref_rate <= MAX_MQTT_REF_TIME)) //Ref rate debe estar entre 1 minuto y 6 horas
+		mem_mqtt_ref_rate = SP.mqtt_ref_rate;
+	else
+		mem_mqtt_ref_rate = SP.mqtt_ref_rate = 10; //No esta inicializado o el valor esta fuera de rango. Adopto 10 min
+
+	/*Timer para refrescar VARIABLES a enviar al broker*/
+	timer_ref_var = xTimerCreate("Tmr_ref_var", mem_mqtt_ref_rate * 60 * 1000,
+	true, (void*) tmr_ref_var_idx, vTmrRefDataCallback);
+
+	/*Timer para refrescar CONTROLES + ID + SETT + EVENTS a enviar al broker*/
+	timer_ref_cise = xTimerCreate("Tmr_ref_cise",
+	CTRL_REF_FACT * mem_mqtt_ref_rate * 60 * 1000,
+	true, (void*) tmr_ref_cise_idx, vTmrRefDataCallback);
+
+	/*Inicializo los valores de las variables*/
+	subscribed = false;
+	conected_to_broker = false;
+	attempt_cnt = 0;
+	cont_coord_report_posit = REF_COUNTER_LIM;
+	fact_ref_rate = 1;
+
+	/*Esperar a estar registrado en la red*/
+	while (gsm.reg_on_netw != TRUE) {
+		vTaskDelay(1000);
+	}
+
+	/*Arranco el timer para publicar variables*/
+	if (xTimerIsTimerActive(timer_ref_var) == pdFALSE) {
+		if (xTimerStart(timer_ref_var, 100) == pdPASS) {
+			xTimerReset(timer_ref_var, 100);
+		}
+	}
+#if UNDER_DEVELOPMENT == 1
+	sprintf(endpoint_url, TEST_ENDPOINT_URL);
+#else
+	/* Leo la URL del endpoint "register" */
+	eeprom_read(endpoint_url, OFF_ENDPOINT_URL,
+	LEN_ENDPOINT_URL);
+#endif
+
+	/*Primer estado al que voy a entrar*/
+	xQueueReset(queMQTT_ev); //Borro cualquier item dentro de la cola.
+	mqtt_prev_st = mqtt_ev_connect_to_broker;
+	next_event(mqtt_ev_req_keys_from_broker);
+
+	while (1) {
+
+		if (xQueueReceive(queMQTT_ev, &mqtt_ev,
+		REF_RATE * fact_ref_rate) == pdPASS) {
+
+			mqtt_sc_init(&mqtt_sc);
+			mqtt_sc_enter(&mqtt_sc);
+
+
+
+//			switch (state) {
+//			case st_GPRS_OFF:
+//				/**/
+//				break;
+//			case st_GPRS_ON:
+//
+//				switch (state_s2) {
+//				case st_Not_Conn:
+//					break;
+//
+//				case st_Conn:
+//					break;
+//				}
+//
+//				break;
+//			default:
+//				break;
+//			}
+
+			/*Chequeo si cambió el refresh rate*/
+			if (mem_mqtt_ref_rate != SP.mqtt_ref_rate) {
+				if (SP.mqtt_ref_rate < 1) { //Es menor a 1 minuto???
+					SP.mqtt_ref_rate = 1;
+				} else if (SP.mqtt_ref_rate > MAX_MQTT_REF_TIME) { //Es mayor a 6 horas??
+					SP.mqtt_ref_rate = MAX_MQTT_REF_TIME;
+				}
+
+				xTimerChangePeriod(timer_ref_var, SP.mqtt_ref_rate * 60 * 1000,
+						0);
+				xTimerChangePeriod(timer_ref_cise,
+						CTRL_REF_FACT * SP.mqtt_ref_rate * 60*1000, 0);
+
+				//Actualizo el nuevo valor
+				mem_mqtt_ref_rate = SP.mqtt_ref_rate;
+
+				next_event(mqtt_ev_publish_sett);
+			}
+
+			/*Si cae varias veces en el mismo estado, se interpondrá un delay de 3 segundos*/
+			if (mqtt_ev != mqtt_ev_publish_variables
+					&& mqtt_prev_st == mqtt_ev) {
+				vTaskDelay(3000); //Espero 3 segundos para repetir el comando
+			}
+			mqtt_prev_st = mqtt_ev;
+
+			if (!debug_gsm) {
+				if (xSemaphoreTake(mtxMOBILE, portMAX_DELAY) == pdTRUE) {
+
+					/*Chequeo si tengo un nuevo APN*/
+					if (gsm.new_apn) {
+
+						gsm.new_apn = false;
+
+						//"UNIFON;internet.gprs.unifon.com.ar;internet;internet"
+						len = sprintf(buff_MQTT, "%s;%s;%s;%s", gsm.oper,
+								gprs_apn, gprs_usr, gprs_pass);
+
+						/*UNICO LUGAR DONDE ALMACENO EL APN EN EEPROM*/
+						guardar_eeprom(buff_MQTT,
+						OFF_GPRS_APN_PROF1 + Var.apn_prof * LEN_APN_PROF,
+								len + 1);
+
+						/*Cerrar la conexión TCP, así utilizo el nuevo APN para abrir una nueva*/
+						TCP_Disconnect(buff_MQTT, MQTT_BUFF_SIZE);
+
+						/*Tengo nuevos parámetros, entonces reinicio el contador para leer mas seguido*/
+						cnt_conn_retry = 0;
+						fact_ref_rate = 1;
+
+						/*Ahora debo conectarme al broker*/
+						next_event(mqtt_ev_req_keys_from_broker);
+					}
+
+					if (TCP_Connect(buff_MQTT, MQTT_BUFF_SIZE, gprs_apn,
+							gprs_usr, gprs_pass)) {
+
+						/*Me pude conectar satisfactoriamente. Entonces reinicio el contador*/
+						cnt_conn_retry = 0;
+						fact_ref_rate = 1;
+
+						switch (mqtt_ev) {
+
+						/*=======================================================================
+						 * 		---	GET CREDENTIALS FROM BROKER ---
+						 */
+						case mqtt_ev_req_keys_from_broker:
+
+							/*Si estoy registrado en Losant, leo las credenciales*/
+							if (SP.already_registered_onlosant) {
+								/* Leo las credenciales almacenadas p LOSANT*/
+								leer_eeprom(clientID, OFF_CLIENT_ID,
+								LEN_CLIENT_ID); //Leo el client ID para Losant
+								leer_eeprom(access_key, OFF_ACCESS_KEY,
+								LEN_ACCESS_KEY); //Leo el access key para Losant
+								leer_eeprom(access_secret,
+								OFF_ACCESS_SECRET,
+								LEN_ACCESS_SECRET); //Leo el access secret para Losant
+
+								/*Ahora debo conectarme al broker*/
+								next_event(mqtt_ev_connect_to_broker);
+							} else {
+								/* Tiene SN asignado??*/
+								if (!strcmp(id_SN, NO_SN)) {
+									/*No tiene SN asignado. Volver a intentar dentro de 30 seg.*/
+									vTaskDelay(30 * 1000);
+									xQueueReset(queMQTT_ev); //Borro cualquier item dentro de la cola.
+									next_inm_state(
+											mqtt_ev_req_keys_from_broker);
+								} else {
+									/*SN Asignado.*/
+									memset(buff_MQTT, 0, MQTT_BUFF_SIZE);
+
+									if (https_get_credentials(buff_MQTT,
+									MQTT_BUFF_SIZE, gprs_apn, gprs_usr,
+											gprs_pass)) {
+										/*Setear la bandera de que tengo las credenciales*/
+										SP.already_registered_onlosant = TRUE;
+
+										/*Guardo SP en EEPROM*/
+										guardar_eeprom((char*) &SP, OFF_SP,
+												sizeof(SP));
+
+										next_event(mqtt_ev_connect_to_broker);
+									} else {
+										//No consiguió las credenciales. Volver a intentar
+										next_event(
+												mqtt_ev_req_keys_from_broker);
+									}
+								}
+							}
+							if (SP.already_registered_onlosant) {
+								/*Imprimo el encabezado que luego usaremos para publicar*/
+								sprintf(losant_state_head, "/losant/%s/state",
+										clientID);
+								ptr = losant_state_head;
+								for (; *ptr; ++ptr)
+									*ptr = tolower(*ptr);
+							}
+							break;
+
+							/*=======================================================================
+							 * 		---	CONNECT TO BROKER ---
+							 */
+						case mqtt_ev_connect_to_broker:
+//							PRINT("Connect to broker");
+							/*Reseteo la cola para borrar posibles acciones*/
+							xQueueReset(queMQTT_ev);
+
+							len = MQTT_connectpacket((uint8_t*) buff_MQTT,
+									clientID, access_key, access_secret);
+							Recb = TCP_send(buff_MQTT, len);
+							if (Recb > 0) {
+								/*El servidor devolvió una respuesta*/
+								if (buff_MQTT[0] == (MQTT_CTRL_CONNECTACK << 4)
+										&& buff_MQTT[1] == 2 //Remaining Length
+												) {
+									switch (buff_MQTT[3]) {
+									case MQTT_CONN_RC_CONN_ACC:
+										//Connection Accepted
+										next_event(mqtt_ev_subscribe);
+										subscribed = false;
+										conected_to_broker = true;
+										break;
+									case MQTT_CONN_RC_CONN_REF_CON:
+										//Connection Refused, unacceptable protocol version.
+										//The Server does not support the level of the MQTT protocol requested by the Client
+									case MQTT_CONN_RC_CONN_REF_UPV:
+										//Connection Refused, identifier rejected
+										//The Client identifier is correct UTF-8 but not allowed by the Server
+									case MQTT_CONN_RC_CONN_REF_IR:
+										//Connection Refused, Server unavailable
+										//The Network Connection has been made but the MQTT service is unavailable
+									case MQTT_CONN_RC_CONN_REF_SU:
+										//Connection Refused, bad user name or password
+										//The data in the user name or password is malformed
+										conected_to_broker = false;
+										break;
+									case MQTT_CONN_RC_CONN_REF_NA:
+										//Connection Refused, not authorized
+										//The Client is not authorized to connect
+										xQueueReset(queMQTT_ev);//Borro cualquier item dentro de la cola.
+										next_event(
+												mqtt_ev_req_keys_from_broker);
+										SP.already_registered_onlosant = false;
+										conected_to_broker = false;
+									}
+								}
+							} else {
+								/*El broker no respondio nada. Puede que este aun conectado*/
+								if (ping_req(buff_MQTT)) {
+									next_event(mqtt_ev_subscribe);
+									subscribed = false;
+									conected_to_broker = true;
+								} else {
+									next_event(mqtt_ev_connect_to_broker);
+									conected_to_broker = false;
+								}
+							}
+							break;
+
+							/*=======================================================================
+							 * 		---	DISCONNECT FROM BROKER ---
+							 */
+						case mqtt_ev_disconnect_from_broker:
+//							PRINT("Disconnect from broker");
+							len = MQTT_DisconnectPacket((uint8_t*) buff_MQTT);
+							Recb = TCP_send(buff_MQTT, len);
+							next_event(mqtt_ev_connect_to_broker);
+							break;
+
+							/*=======================================================================
+							 * 		---	PUBLISH VARIABLES, ID, EVENTS, CTRLS, SETT ---
+							 */
+						case mqtt_ev_publish_variables:
+						case mqtt_ev_publish_id:
+						case mqtt_ev_publish_events:
+						case mqtt_ev_publish_commands:
+						case mqtt_ev_publish_sett:
+						case mqtt_ev_publish_alarms:
+
+							if (attempt_cnt < 3) {
+
+								memset(buff_MQTT, 0, MQTT_BUFF_SIZE);
+
+								/*Publicar VARIABLES*/
+								if (mqtt_ev == mqtt_ev_publish_variables) {
+//									PRINT("PUBLISH VAR");
+									/*Conformo el payload*/
+
+									/*Incremento el contador de refresco de COORD*/
+									if (gps.gps_fix)
+										cont_coord_report_posit++;
+									else
+										cont_coord_report_posit = 0;
+
+									/*Analizo si es hora de enviar las coordenadas*/
+									if (cont_coord_report_posit
+											> REF_COUNTER_LIM) {
+
+										cont_coord_report_posit = 0;
+
+										/*Envio los datos incluyendo COORDENADAS*/
+										sprintf((char*) &buff_MQTT[50], "{"
+												"\"data\":{"
+												"\"tleve\":%.2f,"
+												"\"tlevp\":%d,"
+												"\"cpan\":%.2f,"
+												"\"vbat\":%.2f,"
+												"\"di1\":%d,"
+												"\"di2\":%d,"
+												"\"di3\":%d,"
+												"\"di4\":%d,"
+												"\"od\":%d,"
+												"\"ai1\":%6.2f,"
+												"\"ai2\":%6.2f,"
+												"\"ai3\":%6.2f,"
+												"\"ai4\":%6.2f,"
+												"\"ai5\":%6.2f,"
+												"\"ai6\":%6.2f,"
+												"\"posit\":\"%6.4f,%6.4f\","
+												"\"lpres\":%d,"
+												"\"rssi\":%d"
+												"}}", Var.tank_vol,
+												Var.tank_vol_perc, Var.CPanel,
+												Var.VBatt,
+												(Var.DI & DIn_1_MASK) ? 1 : 0,
+												(Var.DI & DIn_2_MASK) ? 1 : 0,
+												(Var.DI & DIn_3_MASK) ? 1 : 0,
+												(Var.DI & DIn_4_MASK) ? 1 : 0,
+												(Var.DI & DIn_OD_MASK) ? 1 : 0,
+												Var.An[0].Signal,
+												Var.An[1].Signal,
+												Var.An[2].Signal,
+												Var.An[3].Signal,
+												Var.An[4].Signal,
+												Var.An[5].Signal, gps.Lat,
+												gps.Lon, Var.LinePress,
+												gsm.rssi);
+									} else {
+
+										/* Envio los datos sin las coordenadas.*/
+										sprintf((char*) &buff_MQTT[50], "{"
+												"\"data\":{"
+												"\"tleve\":%.2f,"
+												"\"tlevp\":%d,"
+												"\"cpan\":%.2f,"
+												"\"vbat\":%.2f,"
+												"\"di1\":%d,"
+												"\"di2\":%d,"
+												"\"di3\":%d,"
+												"\"di4\":%d,"
+												"\"od\":%d,"
+												"\"ai1\":%6.2f,"
+												"\"ai2\":%6.2f,"
+												"\"ai3\":%6.2f,"
+												"\"ai4\":%6.2f,"
+												"\"ai5\":%6.2f,"
+												"\"ai6\":%6.2f,"
+												"\"lpres\":%d,"
+												"\"rssi\":%d"
+												"}}", Var.tank_vol,
+												Var.tank_vol_perc, Var.CPanel,
+												Var.VBatt,
+												(Var.DI & DIn_1_MASK) ? 1 : 0,
+												(Var.DI & DIn_2_MASK) ? 1 : 0,
+												(Var.DI & DIn_3_MASK) ? 1 : 0,
+												(Var.DI & DIn_4_MASK) ? 1 : 0,
+												(Var.DI & DIn_OD_MASK) ? 1 : 0,
+												Var.An[0].Signal,
+												Var.An[1].Signal,
+												Var.An[2].Signal,
+												Var.An[3].Signal,
+												Var.An[4].Signal,
+												Var.An[5].Signal, Var.LinePress,
+												gsm.rssi);
+									}
+								}
+								/*Publicar ALARMAS*/
+								if (mqtt_ev == mqtt_ev_publish_alarms) {
+									/*Conformo el payload*/
+									sprintf((char*) &buff_MQTT[50], "{"
+											"\"data\":{"
+											"\"al_do\":%d,"
+											"\"al_gf\":%d,"
+											"\"al_lb\":%d,"
+											"\"al_ll\":%d,"
+											"\"al_vll\":%d,"
+											"\"al_ms\":%d"
+											"}}", GetAlarm(Al_DoorOpen) ? 1 : 0,
+											GetAlarm(Al_GenFail) ? 1 : 0,
+											GetAlarm(Al_LowBatt) ? 1 : 0,
+											GetAlarm(Al_War_LowLev) ? 1 : 0,
+											GetAlarm(Al_Alarm_LowLev) ? 1 : 0,
+											GetAlarm(Al_Motor_stall) ? 1 : 0);
+								}
+								/*Publicar ID*/
+								else if (mqtt_ev == mqtt_ev_publish_id) {
+//									PRINT("PUBLISH ID");
+									sprintf((char*) &buff_MQTT[50], "{"
+											"\"data\":{"
+											"\"stg1\":\"%s\","
+											"\"stg2\":\"%s\","
+											"\"stg3\":\"%s\""
+											"}}", &id_Tag[0], &id_Tag[1],
+											&id_Tag[2]);
+								}
+								/*Publicar EVENTOS*/
+								else if (mqtt_ev == mqtt_ev_publish_events) {
+//									PRINT("PUBLISH EV");
+									sprintf((char*) &buff_MQTT[50], "{"
+											"\"data\":{"
+											"\"evod\":\"1\","
+											"\"evms\":\"1\""
+											"}}");
+								}
+								/*Publicar COMANDOS*/
+								else if (mqtt_ev == mqtt_ev_publish_commands) {
+//									PRINT("PUBLISH CTRLS");
+									sprintf((char*) &buff_MQTT[50], "{"
+											"\"data\":{"
+											"\"pum\":%d,"
+											"\"flow\":%.2f,"
+											"\"vunit\":\"%s\","
+											"\"funit\":\"%s\","
+											"\"do1\":%d,"
+											"\"do2\":%d,"
+											"\"do3\":%d,"
+											"\"do4\":%d,"
+											"\"rl1\":%d,"
+											"\"rl2\":%d"
+											"}}", PumpOn ? 1 : 0, SP.PumpRate,
+											Var.vol_unit, Var.flow_unit,
+											(Var.DO & DOut_1_MASK) ? 1 : 0,
+											(Var.DO & DOut_2_MASK) ? 1 : 0,
+											(Var.DO & DOut_3_MASK) ? 1 : 0,
+											(Var.DO & DOut_4_MASK) ? 1 : 0,
+											(Var.DO & DOut_REL1) ? 1 : 0,
+											(Var.DO & DOut_REL2) ? 1 : 0);
+
+								}
+								/*Publicar SETTINGS*/
+								else if (mqtt_ev == mqtt_ev_publish_sett) {
+//									PRINT("PUBLISH SETTINGS");
+									sprintf((char*) &buff_MQTT[50], "{"
+											"\"data\":{"
+											"\"vunit\":\"%s\","
+											"\"funit\":\"%s\","
+											"\"fl_cf\":%.2f,"
+											"\"ref\":%d,"
+											"\"tk_sen_hgt\":%.2f,"
+											"\"tk_den\":%.2f,"
+											"\"tk_shp\":%d,"
+											"\"tk_d1\":%.2f,"
+											"\"tk_d2\":%.2f,"
+											"\"tk_d3\":%.2f,"
+											"\"wrlev\":%d,"
+											"\"allev\":%d,"
+											"\"bt_wl\":%.2f"
+											"}}", Var.vol_unit, Var.flow_unit,
+											SP.CF, SP.mqtt_ref_rate,
+											SP.tnk_sensor_hgt, SP.tnk_dens,
+											SP.tnk_shp,
+											SP.tnk_d1_VT_HT_diam_RT_width,
+											SP.tnk_d2_VT_height_HT_lenght_RT_height,
+											SP.tnk_d3_RT_length,
+											SP.War_TankLevel, SP.AL_TankLevel,
+											gen.low_batt_limit);
+								}
+
+								len = MQTT_publishPacket((uint8_t*) buff_MQTT,
+										losant_state_head,
+										(char*) &buff_MQTT[50],
+										QOS);
+								Recb = TCP_send(buff_MQTT, len);
+
+								if (Recb > 0) {
+									//El servidor devolvió una respuesta
+									if (buff_MQTT[0] == (MQTT_CTRL_PUBACK << 4)
+											&& buff_MQTT[1] == 2 //Remaining Length
+													) {
+										/*Dato recibido OK. Reinicio la cuenta de intentos*/
+										attempt_cnt = 0;
+
+										/*Decido a que proximo estado ir*/
+										if (mqtt_ev
+												== mqtt_ev_publish_variables) {
+											if (!subscribed)
+												next_event(mqtt_ev_subscribe);
+										}
+									} else if (strstr((char*) buff_MQTT,
+											"CLOSED")) {
+										next_event(mqtt_ev_connect_to_broker);
+//										PRINT("CLOSED. Ir a conn to broker");
+									}
+								} else {
+									/*Sin respuesta del server.*/
+									attempt_cnt++;
+									if (QOS == MQTT_QOS_0) {
+									} else {
+//										next_state(mqtt_ping_request);
+										if (ping_req(buff_MQTT)) {
+											conected_to_broker = true;
+										} else {
+											conected_to_broker = false;
+
+											next_event(
+													mqtt_ev_connect_to_broker);
+										}
+									}
+								}
+							} else {
+								/*Superamos la cantidad de intentos para realizar la operacion c exito*/
+								next_event(mqtt_ev_connect_to_broker);
+								attempt_cnt = 0;
+							}
+							break;
+
+							/*=======================================================================
+							 * 		---	SUBSCRIBE ---
+							 */
+						case mqtt_ev_subscribe:
+//							PRINT("SUBSCRIBE");
+							memset(buff_MQTT, 0, MQTT_BUFF_SIZE);
+							sprintf((char*) &buff_MQTT[200],
+									"losant/%s/command", clientID);
+							len = MQTT_subscribePacket((uint8_t*) buff_MQTT,
+									(char*) &buff_MQTT[200],
+									QOS);
+							PackID_LSB = buff_MQTT[3];
+							PackID_MSB = buff_MQTT[2];
+
+							Recb = TCP_send(buff_MQTT, len);
+
+							if (Recb > 0) {
+								//El servidor devolvió una respuesta
+								if (buff_MQTT[0] == (MQTT_CTRL_SUBACK << 4) //Subscribe Ack
+								&& buff_MQTT[1] == 3 //Remaining Length
+								&& buff_MQTT[2] == PackID_MSB	//MSB
+								&& buff_MQTT[3] == PackID_LSB	//LSB
+										) {
+									//Respuesta OK. Continuar
+									subscribed = TRUE;
+
+									/*Averiguo si ya esta corriendo el timer de CISE. En caso de que no este corriendo
+									 * lo pongo a correr y agrego una serie de estados para que actualice la info de
+									 * esos parámetros */
+
+									/*Arranco el timer para publicar CISE*/
+									if (xTimerIsTimerActive(
+											timer_ref_cise) == pdFALSE) {
+										if (xTimerStart(timer_ref_cise,
+												100) == pdPASS) {
+											xTimerReset(timer_ref_cise, 100);
+											/*Incluyo todos los estados para q actualice todos los valores*/
+											next_event(mqtt_ev_publish_id);
+											next_event(
+													mqtt_ev_publish_commands);
+											next_event(mqtt_ev_publish_sett);
+											next_event(mqtt_ev_publish_alarms);
+										}
+									}
+								} else if (strstr((char*) buff_MQTT,
+										"CLOSED")) {
+									next_event(mqtt_ev_connect_to_broker);
+									break;
+								}
+							} else {
+								//Sin respuesta del server. Consulto con un ping...
+								if (ping_req(buff_MQTT)) {
+									conected_to_broker = true;
+								} else {
+									conected_to_broker = false;
+								}
+								break;
+							}
+							break;
+						default:
+							break;
+						}
+
+					} else {
+						/*No me pude conectar satisfactoriamente. Incremento el contador de intentos de conexion */
+						cnt_conn_retry++;
+
+						if (mqtt_ev != mqtt_ev_req_keys_from_broker) {
+							next_inm_state(mqtt_ev_connect_to_broker);
+						}
+
+//						if (mqtt_st != mqtt_req_keys_from_broker) {
+//							next_inm_state(mqtt_connect_to_broker);
+//						}
+					}
+				}
+				xSemaphoreGive(mtxMOBILE);
+
+				if (cnt_conn_retry >= 40) {
+					fact_ref_rate = 24 * 60 * 60 * 1000 / REF_RATE;	//1 día
+				} else if (cnt_conn_retry >= 30) {
+					fact_ref_rate = 30 * 60 * 1000 / REF_RATE;	//30 minutos
+				} else if (cnt_conn_retry >= 20) {
+					fact_ref_rate = 10 * 60 * 1000 / REF_RATE;	//10 minutos
+				} else if (cnt_conn_retry >= 10) {
+					fact_ref_rate = 1 * 60 * 1000 / REF_RATE;	//1 minuto
+				}
+			}
+		} else {
+
+			if (xSemaphoreTake(mtxMOBILE, 2000) == pdTRUE) {
+
+				/* Paso un tiempo desde el ultimo envio de datos.
+				 * Pido un ping para mantener la conexion activa*/
+				if (!ping_req(buff_MQTT)) {
+					next_event(mqtt_ev_connect_to_broker);
+				}
+
+//				if (TCP_Connect(buff_MQTT, MQTT_BUFF_SIZE, gprs_apn, gprs_usr,
+//						gprs_pass)) {
+//
+//					/*Me pude conectar satisfactoriamente. Entonces reinicio el contador*/
+//					cnt_conn_retry = 0;
+//					fact_ref_rate = 1;
+//
+//				} else {
+//					/*No me pude conectar satisfactoriamente. Incremento el contador de intentos de conexion */
+//					cnt_conn_retry++;
+//
+//					if (mqtt_st != mqtt_req_keys_from_broker) {
+//						next_inm_state(mqtt_connect_to_broker);
+//					}
+//				}
+			}
+			xSemaphoreGive(mtxMOBILE);
+
+		}
+	}
+}
+
+void Create_COMM_MQTT_SIM868_task(void) {
+	xTaskCreate(vCOMM_MQTT_Task, (char*) "MQTT TSK", 512,
+	NULL,
+	Prio_COMM_MQTT_Task, &tsk_mqtt_handler);
+}
+
+#endif

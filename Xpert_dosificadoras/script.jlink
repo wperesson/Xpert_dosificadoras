@@ -1,0 +1,7 @@
+ExitOnError 1
+r
+h
+loadfile "D:\Firmware_MCU\REPOSITORIOS\Xpert\Xpert_V01_00\Debug\Xpert_V01_00.hex"
+qc
+
+qc

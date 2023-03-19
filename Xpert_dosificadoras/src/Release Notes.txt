@@ -1,0 +1,70 @@
+
+
+
+=========================¬
+Version 2.00 (Ene 2018)¬
+=========================¬
+
+
+KNOWN BUGS:
+1-Si cambio el Flowrate desde otro medio que no sea la pantalla no se graba en EEPROM.
+
+BUG FIXES:
+1- Arreglado un bug por el cual cuando se entraba al sistema de debugging por RS485 al seleccionar la opción 3 para salir de dicho sistema el controlador no reconocia la
+opcion como válida y por lo tanto no finalizaba la ejecución de la rutina hasta q vencía el tiempo de inactividad, motivo por el cual si salia del sistema de debugging.
+Se cambió el texto "Select an option or type 'quit' to return:" por "Select an option:".
+2- Se agregó un campo mas en la cola de envio de mensajes al módulo GSM de modo que ahora el mensaje no se transmite mas por el buffer gsm.message (este se elimino), sino 
+que se envia dentro del mensaje en la cola.
+3- Se arregló un bug por el cual cuando se enviaban mensajes desde la tarea Task_485 al módulo GSM se podia realizar en bajas cantidades de bytes, menores a 8, y esto no permitia 
+copiar y pegar en la consola porque se perdian caracteres. Esta mejora permite copiar y pegar caracteres.
+4- Se reparó un bug por el cual si la alarma de WARNING de bajo caudal se activaba a cada rato debido al ruido del canal del ADC. El contador que tenia solo sumaba pero no reiniciaba 
+la cuenta al momento de que no se cumpliera la condicion de reseteo. Entonces cada vez que el nivel pasaba de determinado limite, el contador sumaba y al llegar al limite de conteo 
+seteaba la alarma.
+5- Idem al punto 4 pero para el ALARM de nivel del tanque. (NO HARÍA FALTA CONTAR LAS VECES Q ENVIAMOS EL SMS DE ADVERTENCIA)
+6- Arregle una situación donde cuando se abria la puerta y luego de enviar un SMS de advertencia, se contaba un tiempo para volver a activar el envio de mensajes de apertura de puerta.
+Si se cerraba y habria la puerta, la cuenta continuaba desde la ultima posición. De este modo podría pasar q la última oportunidad que se cerrara la puerta, el contador este cerca del 
+valor límite y active nuevamente el envio de mensajes. Ahora, cada vez que se abre la puerta debe permanecer cerrada por 10 minutos para que se active el envío de SMS nuevamente. 
+
+NEW FEATURES:
+1- Actualizado FreeRTOS a la version v10.0.0
+2- Se quitó el buffer de la struct gsm y se relocalizaron dentro de la tarea Task_CommGSM de modo que el contenido quede protegido por la misma.
+
+
+UNDER DEVELOPMENT:
+
+1- Ubidots routines
+2- IAP flash programming for OTA
+3- HMI OTA from FTP using SIM868
+4- Resetear la energía del monitor a la medianoche de modo que la energia corresponda a cada dia
+5- Modificar la salida que maneja el PumpOn en un solo lugar.+++DONE+++
+6- Verificar la rutina de cálculo de totalizador.+++TESTEAR+++
+7- Implementar rutina de configuración de módulo XBEE cuando se cambia el BR del micro.
+8- Enviar solamente 4 veces por día la alarma de tank level.
+
+
+HMI BUG FIXES:
+
+1- Se corrigió la palabra WIDE por WIDTH en el menú de tanques para la opcion de tanque de forma rectangular.
+
+HMI Improvements
+
+1- Se cambió el orden de usuarios en la pantalla "Set user passwords". Ahora quedaron ordenadas según nivel de acceso de arriba para abajo.
+2- Se quitaron imágenes, y fuentes para achicar la memoria necesaria para el hmi. Pasamos de casi 1MB a 310KB.
+3- Se agregó el control de APN en Settings->Communications->GSM/GPRS de modo que se puede setear el APN desde el panel frontal
+
+
+
+
+===========================================================================¬
+Version 1.01 (Dic 2017)¬	INITIAL DEPLOYMENT
+===========================================================================¬
+
+Field deployment in KWT. We programmed 80 controllers.
+
+Known BUGS:
+
+1-La energía del monitor no se resetea en ningún momento. Debería resetearse cada día de modo de tener la energía generada por día.
+
+HMI BUGS
+1- En la pantalla de configuración del tanque rectangular dice WIDE y deberia decir WIDTH
+2- La energía medida en el monitor de energia se muestra en Joules pero esta en KJ.
