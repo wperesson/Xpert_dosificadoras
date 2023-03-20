@@ -96,10 +96,12 @@ bool mobile_init(MOBILE_T *_mobile) {
 			return false;
 	}
 
-	if (!mobile_get_AT_replay(_mobile)) {
-		_mobile->status.module_running = 0;
+//	if (!mobile_get_AT_replay(_mobile)) {
+//		_mobile->status.module_running = 0;
+//		return false;
+//	}
+	if (isMobilePoweredON(_mobile) == false)
 		return false;
-	}
 
 	/*Leer el IMEI \r\r\n865456053725444\r\n\r\nOK\r\n*/
 	if (mobile_get_info(_mobile, IMEI, 4000)) {
@@ -138,7 +140,7 @@ bool mobile_init(MOBILE_T *_mobile) {
 	sendCheckReply(_mobile, "AT+CMNB=2", OK_CHAR, 2000);
 #else
 	sendCheckReply(_mobile, "AT+CMNB=1",
-			OK_CHAR, 2000);
+	OK_CHAR, 2000);
 #endif
 
 	mobile_set_apn_manually(_mobile);
@@ -166,14 +168,14 @@ bool mobile_init(MOBILE_T *_mobile) {
 }
 
 void decodeCredentials(const MOBILE_DATA_T *data, char *ptr) {
-/*
-{
-  "deviceId" : "62605a7360444f93b8484a52",
-  "key" : "4eddcb4f-2b47-4c83-8f26-85a3ee9fc480",
-  "secret" : "069e6015d821a565be3db4d52db083cd05c4ad764e006e2cdf185206cf512ac5",
-  "error" : ""
-}
- */
+	/*
+	 {
+	 "deviceId" : "62605a7360444f93b8484a52",
+	 "key" : "4eddcb4f-2b47-4c83-8f26-85a3ee9fc480",
+	 "secret" : "069e6015d821a565be3db4d52db083cd05c4ad764e006e2cdf185206cf512ac5",
+	 "error" : ""
+	 }
+	 */
 	ptr = strstr(data->bufferRX, "\"deviceId\"");
 	if (ptr) {
 
@@ -212,8 +214,8 @@ void decodeCredentials(const MOBILE_DATA_T *data, char *ptr) {
 	}
 }
 
-Bool verifyNetworkRegistration(MOBILE_T *mobile2)
-{	bool isInitIsOk;
+Bool verifyNetworkRegistration(MOBILE_T *mobile2) {
+	bool isInitIsOk;
 	uint8_t retriesCounter = 0;
 	isInitIsOk = false;
 	while (isInitIsOk == false) {
@@ -249,37 +251,36 @@ Bool verifyNetworkRegistration(MOBILE_T *mobile2)
 //		return true;
 //
 //}
-Bool networConnection(MOBILE_T *mobile2)
-{
+Bool networConnection(MOBILE_T *mobile2) {
 	if (mobile_get_AT_replay(mobile2) == false)
-			return false;
+		return false;
 
-		if (mobile_gprs_attach(mobile2) == false)
-			return false;
+	if (mobile_gprs_attach(mobile2) == false)
+		return false;
 
-		vTaskDelay(2000);
+	vTaskDelay(2000);
 
-		if (tcpipActivateNetworkConnection(mobile2) == false)
-			return false;
-		return true;
+	if (tcpipActivateNetworkConnection(mobile2) == false)
+		return false;
+	return true;
 }
-Bool connectToLosant(MOBILE_T *mobile2){
+Bool connectToLosant(MOBILE_T *mobile2) {
 	uint8_t retriesCounter = 0;
 
 	mqtt_config_conn_to_broker(mobile2, 1883, 240);
 
-		/* Abro la conexión con el broker */
-		retriesCounter = 0;
-		while (false == mqtt_connect_to_broker(mobile2)) {
-			if (mqtt_check_broker_connection(mobile2))
-				break;
-			retriesCounter++;
-			/* Cierro conexión con el broker */
-			mqtt_disconnect_from_broker(mobile2);
-			vTaskDelay(2000);
-			if (retriesCounter > 2)
-				return false;
-		}
+	/* Abro la conexión con el broker */
+	retriesCounter = 0;
+	while (false == mqtt_connect_to_broker(mobile2)) {
+		if (mqtt_check_broker_connection(mobile2))
+			break;
+		retriesCounter++;
+		/* Cierro conexión con el broker */
+		mqtt_disconnect_from_broker(mobile2);
+		vTaskDelay(2000);
+		if (retriesCounter > 2)
+			return false;
+	}
 	return true;
 
 }
@@ -313,7 +314,7 @@ Bool connectToLosant(MOBILE_T *mobile2){
 //}
 
 static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
-	char buff_MQTT[MQTT_BUFF_SIZE],head[70],buff_Tx[300];
+	char buff_MQTT[MQTT_BUFF_SIZE], head[70], buff_Tx[300];
 	static uint16_t len, mem_mqtt_ref_rate;
 	static uint16_t msgID;
 	static tcp_send_Type Recb;
@@ -379,16 +380,16 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 	mobile2.data.bufferTX_size = 300;
 	mobile2.data.fr_mobile = queMsgFromMOBILE;
 	mobile2.data.to_mobile = queMsgToMOBILE;
-	strcpy(mobile2.credential.broker_url,"broker.losant.com");
+	strcpy(mobile2.credential.broker_url, "broker.losant.com");
 	strcpy(mobile2.network.gprs_apn, GPRS_APN);
 	strcpy(mobile2.network.gprs_usr, GPRS_USER);
 	strcpy(mobile2.network.gprs_pass, GPRS_PASS);
 	//XP20-06-1006(ELEC EDGE)
-		sprintf(mobile2.credential.masterClientID, "62c6f62fe5e14ef7561350b6");
-		sprintf(mobile2.credential.access_key,
-		"23051234-1bca-4867-9c87-5ae45128ef59");
-		sprintf(mobile2.credential.access_secret,
-		"fb4464ef2950c78b0e62ee275b3fc168522a1bb08c8c1f11b9580309f8feade2");
+	sprintf(mobile2.credential.ClientID, "62c6f62fe5e14ef7561350b6");
+	sprintf(mobile2.credential.access_key,
+			"23051234-1bca-4867-9c87-5ae45128ef59");
+	sprintf(mobile2.credential.access_secret,
+			"fb4464ef2950c78b0e62ee275b3fc168522a1bb08c8c1f11b9580309f8feade2");
 	//XP20-06-1004
 //	sprintf(mobile2.credential.masterClientID, "62a1eb86d33740be22629d0b");
 //	sprintf(mobile2.credential.access_key,
@@ -414,47 +415,47 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 //	"260caa77-670b-4b9a-9789-378efc42fa3c");
 //	sprintf(mobile2.credential.access_secret,
 //	"676f21a0f21c45b420079c843a82d04d2381fd53ab03a9396c6cdab7917b3144");
-		//XP20-06-1015(ELEC ANGOLA)
+	//XP20-06-1015(ELEC ANGOLA)
 //			sprintf(mobile2.credential.masterClientID, "6349ccd17d45bd309dc938cf");
 //			sprintf(mobile2.credential.access_key,
 //			"0fe08cd3-831c-44fa-b68d-fc0f9a8c87f1");
 //			sprintf(mobile2.credential.access_secret,
 //			"b5e30b87d561d023602daf64d2d7b985d956914a2bc9b4304a5509069c0a1d4b");
-		//XP20-06-1019
+	//XP20-06-1019
 //			sprintf(mobile2.credential.masterClientID, "63c44b642d06e7dae51da97d");
 //			sprintf(mobile2.credential.access_key,
 //			"fedf6bc7-6eaa-4ece-8d5b-bc0301508465");
 //			sprintf(mobile2.credential.access_secret,
 //			"f99b41e283c1db5895e62ed34a6d8e3e28504a09c2ea97fb6786614f8f31a7fb");
-		//XP20-06-1020
+	//XP20-06-1020
 //			sprintf(mobile2.credential.masterClientID, "63c4498af4f9ead7f48d759e");
 //			sprintf(mobile2.credential.access_key,
 //			"4ff22798-b564-4d8a-9719-32f1f8e07728");
 //			sprintf(mobile2.credential.access_secret,
 //			"c0af0e61897cae629e22c3eb7641d877c3becfbddc644b3f7ac44ccd94b2b2d3");
-		//XP20-06-1018
+	//XP20-06-1018
 //			sprintf(mobile2.credential.masterClientID, "63c44b262d06e7dae51da97b");
 //			sprintf(mobile2.credential.access_key,
 //			"8cf443a1-1a4d-4111-b542-b237d02e44eb");
 //			sprintf(mobile2.credential.access_secret,
 //			"b35fee7786c65449789f739b3b26446e5ddcc343614b81cc644a836bf6d1ab8e");
-		//XP20-06-1021
+	//XP20-06-1021
 //			sprintf(mobile2.credential.masterClientID, "63dd1307cf8730bff67fed06");
 //			sprintf(mobile2.credential.access_key,
 //			"92fa9843-01d7-49b1-bf51-377f7be86de0");
 //			sprintf(mobile2.credential.access_secret,
 //			"a5daff45841024cc77f4f6b6fa79091d86a827685fa5c3735e1abd19921e06c9");
-		//XP20-06-1022
+	//XP20-06-1022
 //			sprintf(mobile2.credential.masterClientID, "63dd3732bcfc09f21ed650d8");
 //			sprintf(mobile2.credential.access_key,
 //			"f4a0dfd1-9b50-46c2-bd93-77717a529476");
 //			sprintf(mobile2.credential.access_secret,
 //			"7692a4e74e2f253d5c450bb16be718ef5228c31c686ced673bf758e586fc00d8");
-		//XP20-06-1023
-			sprintf(mobile2.credential.masterClientID, "63dd375fcf8730bff67fed7d");
-			sprintf(mobile2.credential.access_key,
+	//XP20-06-1023
+	sprintf(mobile2.credential.ClientID, "63dd375fcf8730bff67fed7d");
+	sprintf(mobile2.credential.access_key,
 			"292d95a8-ed9f-4522-a099-bff5b5f20ac4");
-			sprintf(mobile2.credential.access_secret,
+	sprintf(mobile2.credential.access_secret,
 			"6625ab931fabe968f347f41d24cd50009d241b79fc449fca0aee12c8684391e2");
 
 	while (1) {
@@ -483,7 +484,8 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 				if (xSemaphoreTake(mtxMOBILE, portMAX_DELAY) == pdTRUE) {
 					/* Reviso si el modulo esta registrado*/
 
-					if (isMobilePoweredON(&mobile2)&&mobile_get_register_status(&mobile2))
+					if (isMobilePoweredON(&mobile2)
+							&& mobile_get_register_status(&mobile2))
 						isInitIsOk = true;
 					else
 						isInitIsOk = mobile_init(&mobile2);
@@ -537,12 +539,13 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 //								if (https_get_credentials(&data, gprs_apn,
 //										gprs_usr, gprs_pass, id_SN,
 //										CONTROLLER_TYPE, endpoint_url))
-								if(1){
-									sprintf(mobile2.credential.masterClientID, "63dd375fcf8730bff67fed7d");
+								if (1) {
+									sprintf(mobile2.credential.ClientID,
+											"63dd375fcf8730bff67fed7d");
 									sprintf(mobile2.credential.access_key,
-									"292d95a8-ed9f-4522-a099-bff5b5f20ac4");
+											"292d95a8-ed9f-4522-a099-bff5b5f20ac4");
 									sprintf(mobile2.credential.access_secret,
-									"6625ab931fabe968f347f41d24cd50009d241b79fc449fca0aee12c8684391e2");
+											"6625ab931fabe968f347f41d24cd50009d241b79fc449fca0aee12c8684391e2");
 
 									//decodeCredentials(&data, ptr);
 									/*Setear la bandera de que tengo las credenciales*/
@@ -575,28 +578,19 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 
 						/*Reseteo la cola para borrar posibles acciones*/
 						xQueueReset(queMQTT_ev);
-						if(verifyNetworkRegistration(&mobile2))
-						{
-							if(networConnection(&mobile2))
-							{
-								if(!connectToLosant(&mobile2))
-								{
+						if (verifyNetworkRegistration(&mobile2)) {
+							if (networConnection(&mobile2)) {
+								if (!connectToLosant(&mobile2)) {
 									next_event(mqtt_ev_disconnect_from_broker);
 
-								}
-								else
-								{
-									conected_to_broker=true;
+								} else {
+									conected_to_broker = true;
 									next_event(mqtt_ev_subscribe);
 								}
-							}
-							else
-							{
+							} else {
 								next_event(mqtt_ev_connect_to_broker);
 							}
-						}
-						else
-						{
+						} else {
 							next_event(mqtt_ev_connect_to_broker);
 						}
 
@@ -637,7 +631,8 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 					case mqtt_ev_publish_sett:
 					case mqtt_ev_publish_alarms:
 
-						if ((attempt_cnt < 3) && mqtt_check_broker_connection(&mobile2)) {
+						if ((attempt_cnt < 3)
+								&& mqtt_check_broker_connection(&mobile2)) {
 
 							memset(buff_MQTT, 0, MQTT_BUFF_SIZE);
 
@@ -829,7 +824,7 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 //							Recb = LTE_mqtt_publish(buff_MQTT, MQTT_BUFF_SIZE,
 //									len, losant_state_head, &msgID);
 							sprintf((char*) head, "losant/%s/state",
-															mobile2.credential.masterClientID);
+									mobile2.credential.ClientID);
 							mqtt_publish(&mobile2, len, head);
 
 						} else {
@@ -847,18 +842,18 @@ static portTASK_FUNCTION(vCOMM_MQTT_Task,pvParameters) {
 						memset(buff_MQTT, 0, MQTT_BUFF_SIZE);
 
 						len = sprintf((char*) buff_MQTT, "losant/%s/command",
-								mobile2.credential.masterClientID);
+								mobile2.credential.ClientID);
 						mqtt_unsubscribe(&mobile2, buff_MQTT);
 						len = sprintf((char*) buff_MQTT, "losant/%s/command",
-														mobile2.credential.masterClientID);
+								mobile2.credential.ClientID);
 						subscribed = mqtt_subscribe(&mobile2, buff_MQTT, 0);
 
 						memset(buff_MQTT, 0, MQTT_BUFF_SIZE);
 						len = sprintf((char*) buff_MQTT, "losant/%s/state",
-								mobile2.credential.masterClientID);
+								mobile2.credential.ClientID);
 						mqtt_unsubscribe(&mobile2, buff_MQTT);
 						len = sprintf((char*) buff_MQTT, "losant/%s/state",
-								mobile2.credential.masterClientID);
+								mobile2.credential.ClientID);
 						subscribed = mqtt_subscribe(&mobile2, buff_MQTT, 0);
 //						subscribed = LTE_mqtt_subscribe(buff_MQTT,
 //						MQTT_BUFF_SIZE, len);

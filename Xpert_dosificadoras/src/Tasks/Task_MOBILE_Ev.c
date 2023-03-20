@@ -153,8 +153,10 @@ static portTASK_FUNCTION(vCOMM_MOB_Ev_Task,pvParameters) {
 							break;
 					}
 
-					if (!mobile_get_AT_replay(&mobile)) {
-						gsm.module_running = 0;
+//					if (!mobile_get_AT_replay(&mobile)) {
+//						gsm.module_running = 0;
+
+					if (isMobilePoweredON(&mobile) == false){
 
 						if (!debug_gsm) {
 							EvtToMOB.Src = MOBILE_Init;
@@ -466,7 +468,7 @@ static portTASK_FUNCTION(vCOMM_MOB_Ev_Task,pvParameters) {
 
 											ptr = strtok(NULL, " ,\r\n");
 											if (ptr != NULL)
-												gsm.act = atoi(ptr);
+												gsm.accessTechnology = atoi(ptr);
 
 										}
 
